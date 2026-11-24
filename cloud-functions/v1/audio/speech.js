@@ -1,17 +1,17 @@
 import WebSocket from "ws";
+import crypto from "crypto"; // 用于 CS64 哈希计算
 
 const SECRET_KEY = "Arcer5202hy88vh8";
 const DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural";
 
 const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D6837491F6";
-const SEC_MS_GEC_VERSION = "1-143.0.3650.75";
+// 版本号必须使用 2- 前缀
+const SEC_MS_GEC_VERSION = "2-155.0.4283.45"; 
 
-// 微软新端点：WebSocket 协议
 const SYNTHESIS_URL = "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1";
-// 获取 STS Token 的 HTTP 端点
 const TOKEN_URL = "https://api.msedgeservices.com/tts/cognitiveservices/v1";
 
-const SUPPORTED_VOICES = [
+const SUPPORTED_VOICES = [ /* ... 音色列表保持不变 ... */ 
   "zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-YunjianNeural",
   "zh-CN-XiaoyiNeural", "zh-CN-YunyangNeural", "zh-CN-XiaoshuangNeural",
   "zh-CN-liaoning-XiaobeiNeural", "zh-CN-shaanxi-XiaoniNeural",
@@ -37,26 +37,51 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
 
 function escapeXml(text) {
   return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
-async function generateSecMsGec() {
-  const WIN_EPOCH_OFFSET = 11644473600;
+// ============================================================
+// v2 令牌生成核心：CS64 + SHA-256
+// 算法参考 rany2/edge-tts 项目 drm.py 中的 v2 实现
+// ============================================================
+const WIN_EPOCH_OFFSET = 11644473600;
+// 微软版权常量前缀，v2 必须携带
+const COPYRIGHT_CONSTANT = "Copyright (c) Microsoft Corporation. All rights reserved.";
+
+// CS64 哈希 (简化的位运算，用于 v2 令牌)
+function cs64Hash(data) {
+  let hash1 = 0x9E3779B9;
+  let hash2 = 0x9E3779B9;
+  for (let i = 0; i < data.length; i += 2) {
+    const c1 = i < data.length ? data.charCodeAt(i) : 0;
+    const c2 = i + 1 < data.length ? data.charCodeAt(i + 1) : 0;
+    hash1 = (hash1 + c1 + (hash2 << 6) + (hash2 >> 2)) >>> 0;
+    hash2 = (hash2 + c2 + (hash1 << 6) + (hash1 >> 2)) >>> 0;
+  }
+  // 输出 16 位十六进制
+  return (hash1 ^ hash2).toString(16).padStart(16, '0').toUpperCase();
+}
+
+async function generateSecMsGecV2() {
   let ticks = Math.floor(Date.now() / 1000) + WIN_EPOCH_OFFSET;
-  ticks -= ticks % 300;
+  ticks -= ticks % 300; // 5 分钟窗口
   ticks *= 10000000;
-  const str = `${ticks.toFixed(0)}${TRUSTED_CLIENT_TOKEN}`;
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
-  return Array.from(new Uint8Array(hash))
-    .map(b => b.toString(16).padStart(2, "0"))
-    .join("")
-    .toUpperCase();
+
+  const baseStr = `${ticks.toFixed(0)}${TRUSTED_CLIENT_TOKEN}`;
+  const strToHash = `${COPYRIGHT_CONSTANT}${baseStr}`;
+
+  // CS64 哈希
+  const cs64Part = cs64Hash(strToHash);
+
+  // SHA-256 哈希 (使用 Node.js crypto)
+  const sha256Hash = crypto.createHash('sha256').update(strToHash).digest('hex').toUpperCase();
+
+  // 组合格式: <16位十六进制>-<64位十六进制>
+  return `${cs64Part}-${sha256Hash}`;
 }
 
+// 获取 STS Token (使用 v2 令牌)
 async function getStsToken(secMsGec) {
   const url = `${TOKEN_URL}?Ocp-Apim-Subscription-Key=${TRUSTED_CLIENT_TOKEN}`;
   const resp = await fetch(url, {
@@ -77,11 +102,10 @@ async function getStsToken(secMsGec) {
   return token;
 }
 
-// ---------- WebSocket 合成核心 ----------
+// ---------- WebSocket 合成核心 (逻辑不变) ----------
 function synthesizeViaWebSocket(token, ssml, secMsGec) {
   return new Promise((resolve, reject) => {
     const url = `${SYNTHESIS_URL}?token=${token}`;
-
     const ws = new WebSocket(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
@@ -92,34 +116,16 @@ function synthesizeViaWebSocket(token, ssml, secMsGec) {
 
     const audioChunks = [];
     let settled = false;
-
     const cleanup = () => {
-      if (!settled) {
-        settled = true;
-        try { ws.terminate(); } catch (e) {}
-      }
+      if (!settled) { settled = true; try { ws.terminate(); } catch (e) {} }
     };
-
     const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error("WebSocket 合成超时（30秒）"));
+      cleanup(); reject(new Error("WebSocket 合成超时（30秒）"));
     }, 30000);
 
     ws.on("open", () => {
-      // 1. 发送 speech.config
-      const config = {
-        context: {
-          synthesis: {
-            audio: {
-              metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: false },
-              outputFormat: "audio-24khz-48kbitrate-mono-mp3"
-            }
-          }
-        }
-      };
+      const config = { context: { synthesis: { audio: { metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: false }, outputFormat: "audio-24khz-48kbitrate-mono-mp3" } } } };
       ws.send(JSON.stringify(config));
-
-      // 2. 发送 SSML（带文本头）
       const ssmlMessage = `Path: ssml\r\nX-RequestId: ${crypto.randomUUID().replace(/-/g, "")}\r\nX-Timestamp: ${new Date().toISOString()}\r\nContent-Type: application/ssml+xml\r\n\r\n${ssml}`;
       ws.send(ssmlMessage);
     });
@@ -130,39 +136,24 @@ function synthesizeViaWebSocket(token, ssml, secMsGec) {
         if (buf.length > 2) {
           const headerLength = buf.readUInt16BE(0);
           const audioStart = 2 + headerLength;
-          if (buf.length > audioStart) {
-            audioChunks.push(buf.subarray(audioStart));
-          }
+          if (buf.length > audioStart) audioChunks.push(buf.subarray(audioStart));
         }
       } else {
         const text = data.toString();
         if (text.includes("Path:turn.end")) {
-          clearTimeout(timeout);
-          cleanup();
-          if (audioChunks.length === 0) {
-            reject(new Error("WebSocket 合成完成但未收到音频数据"));
-          } else {
-            resolve(Buffer.concat(audioChunks));
-          }
+          clearTimeout(timeout); cleanup();
+          if (audioChunks.length === 0) reject(new Error("WebSocket 合成完成但未收到音频数据"));
+          else resolve(Buffer.concat(audioChunks));
         }
       }
     });
 
-    ws.on("error", (err) => {
-      clearTimeout(timeout);
-      cleanup();
-      reject(new Error(`WebSocket 连接失败: ${err.message}`));
-    });
-
+    ws.on("error", (err) => { clearTimeout(timeout); cleanup(); reject(new Error(`WebSocket 连接失败: ${err.message}`)); });
     ws.on("close", (code, reason) => {
       if (!settled) {
-        clearTimeout(timeout);
-        settled = true;
-        if (audioChunks.length > 0) {
-          resolve(Buffer.concat(audioChunks));
-        } else {
-          reject(new Error(`WebSocket 意外关闭: code=${code}, reason=${reason.toString()}`));
-        }
+        clearTimeout(timeout); settled = true;
+        if (audioChunks.length > 0) resolve(Buffer.concat(audioChunks));
+        else reject(new Error(`WebSocket 意外关闭: code=${code}, reason=${reason.toString()}`));
       }
     });
   });
@@ -171,24 +162,11 @@ function synthesizeViaWebSocket(token, ssml, secMsGec) {
 // ---------- 主入口 ----------
 export default function onRequest(context) {
   const { request } = context;
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization"
-  };
-
-  if (request.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
-  }
-  if (request.method !== "POST") {
-    return new Response("Method not allowed", { status: 405, headers: corsHeaders });
-  }
-
+  const corsHeaders = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,POST,OPTIONS", "Access-Control-Allow-Headers": "Content-Type,Authorization" };
+  if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: corsHeaders });
   const auth = request.headers.get("Authorization");
-  if (!auth || auth !== `Bearer ${SECRET_KEY}`) {
-    return jsonResponse({ error: "key错误" }, 401, corsHeaders);
-  }
-
+  if (!auth || auth !== `Bearer ${SECRET_KEY}`) return jsonResponse({ error: "key错误" }, 401, corsHeaders);
   return handleSpeech(request, corsHeaders);
 }
 
@@ -196,62 +174,40 @@ async function handleSpeech(request, corsHeaders) {
   try {
     const body = await request.json();
     const { input, model, voice, speed = 1.0 } = body;
-    if (!input) {
-      return jsonResponse({ error: "缺少input文本" }, 400, corsHeaders);
-    }
+    if (!input) return jsonResponse({ error: "缺少input文本" }, 400, corsHeaders);
 
     let resolvedVoice = voice;
     if (model) {
-      if (!SUPPORTED_VOICES.includes(model) && !COMPAT_MODELS.includes(model)) {
-        return jsonResponse({ error: `模型 ${model} 不存在` }, 404, corsHeaders);
-      }
+      if (!SUPPORTED_VOICES.includes(model) && !COMPAT_MODELS.includes(model)) return jsonResponse({ error: `模型 ${model} 不存在` }, 404, corsHeaders);
       if (SUPPORTED_VOICES.includes(model) && !voice) resolvedVoice = model;
     }
     if (!resolvedVoice) resolvedVoice = DEFAULT_VOICE;
-    if (!SUPPORTED_VOICES.includes(resolvedVoice)) {
-      return jsonResponse({ error: `音色 ${resolvedVoice} 不存在` }, 400, corsHeaders);
-    }
+    if (!SUPPORTED_VOICES.includes(resolvedVoice)) return jsonResponse({ error: `音色 ${resolvedVoice} 不存在` }, 400, corsHeaders);
 
-    const rateStr =
-      typeof speed === "number" ? `${Math.round(speed * 100)}%` : String(speed);
-
-    const secMsGec = await generateSecMsGec();
+    const rateStr = typeof speed === "number" ? `${Math.round(speed * 100)}%` : String(speed);
+    
+    // 生成 v2 令牌
+    const secMsGec = await generateSecMsGecV2();
 
     let token;
     try {
       token = await getStsToken(secMsGec);
     } catch (err) {
-      return jsonResponse(
-        { error: "获取STS token失败", detail: err.message },
-        502,
-        corsHeaders
-      );
+      return jsonResponse({ error: "获取STS token失败", detail: err.message }, 502, corsHeaders);
     }
 
-    const ssml = `<speak version='1.0' xml:lang='zh-CN'><voice name='${resolvedVoice}'><prosody rate='${rateStr}'>${escapeXml(
-      input
-    )}</prosody></voice></speak>`;
+    const ssml = `<speak version='1.0' xml:lang='zh-CN'><voice name='${resolvedVoice}'><prosody rate='${rateStr}'>${escapeXml(input)}</prosody></voice></speak>`;
 
     let audioBuffer;
     try {
       audioBuffer = await synthesizeViaWebSocket(token, ssml, secMsGec);
     } catch (err) {
-      return jsonResponse(
-        { error: "WebSocket 合成失败", detail: err.message },
-        502,
-        corsHeaders
-      );
+      return jsonResponse({ error: "WebSocket 合成失败", detail: err.message }, 502, corsHeaders);
     }
 
-    return new Response(audioBuffer, {
-      headers: { "Content-Type": "audio/mpeg", ...corsHeaders }
-    });
+    return new Response(audioBuffer, { headers: { "Content-Type": "audio/mpeg", ...corsHeaders } });
   } catch (error) {
     console.error("TTS 云函数执行失败:", error?.message || error);
-    return jsonResponse(
-      { error: "语音合成服务暂时不可用，请稍后重试" },
-      503,
-      corsHeaders
-    );
+    return jsonResponse({ error: "语音合成服务暂时不可用，请稍后重试" }, 503, corsHeaders);
   }
 }
