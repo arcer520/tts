@@ -1,9 +1,1 @@
-{
-  "routes": [
-    {
-      "src": "^/v1/(.*)$",
-      "dest": "/api/v1/$1"
-    },
-    { "handle": "filesystem" }
-  ]
-}
+
