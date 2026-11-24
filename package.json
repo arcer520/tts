@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "ws": "^8.18.0"
+    "node-edge-tts": "^2.0.0"
   }
 }
