@@ -1,4 +1,4 @@
-import * as edgeTTSModule from "node-edge-tts";
+import { EdgeTTS } from "node-edge-tts";
 
 // 配置区
 const SECRET_KEY = "Arcer5202hy88vh8";
@@ -6,9 +6,9 @@ const ALLOW_ORIGIN = "*";
 const DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural";
 const CACHE_TTL = 60 * 60 * 1000;
 
-// OpenAI 标准模型别名
+// OpenAI 标准模型标识
 const OPENAI_TTS_MODELS = ["tts-1", "tts-1-hd"];
-// OpenAI 原生 voice 名称映射（可选，智能体有可能传 alloy / echo 这类，映射到微软音色）
+// OpenAI voice 别名 -> 微软音色映射
 const OPENAI_VOICE_MAP = {
   "alloy": "en-US-AriaNeural",
   "echo": "en-US-GuyNeural",
@@ -18,7 +18,7 @@ const OPENAI_VOICE_MAP = {
   "shimmer": "en-US-SaraNeural"
 };
 
-// 兜底备用音色
+// 兜底音色列表（微软接口挂掉时备用）
 const FALLBACK_VOICES = [
   "zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-YunjianNeural",
   "zh-CN-XiaoyiNeural", "zh-CN-YunyangNeural", "zh-CN-XiaoshuangNeural",
@@ -39,44 +39,35 @@ let cacheTs = 0;
 
 async function fetchVoiceList() {
   try {
-    const url = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D683791F6";
+    const url = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A0572DC-6AD4-4869-A51C-EC3C03056CD0";
     const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
     if (!resp.ok) throw new Error(`fetch voice list http ${resp.status}`);
     const raw = await resp.json();
     return raw.map(item => item.ShortName).filter(Boolean);
-  } catch (e) {
-    console.error("拉取微软音色列表失败，使用兜底列表：", e.message);
+  } catch (err) {
+    console.error("获取微软音色列表失败，使用兜底列表：", err.message);
     return FALLBACK_VOICES;
   }
 }
 
 async function getVoiceList() {
   const now = Date.now();
-  if (voiceCache && now - cacheTs < CACHE_TTL) {
-    return voiceCache;
-  }
+  if (voiceCache && now - cacheTs < CACHE_TTL) return voiceCache;
   voiceCache = await fetchVoiceList();
   cacheTs = now;
   return voiceCache;
 }
 
+// 从音色 ID 自动解析语言
 function getLangFromVoiceId(voiceId) {
-  const match = voiceId.match(/^([a-z]{2}-[A-Z]{2})-/);
-  return match ? match[1] : "zh-CN";
+  const m = voiceId.match(/^([a-z]{2}-[A-Z]{2})-/);
+  return m ? m[1] : "zh-CN";
 }
 
-const EdgeTTSClass =
-  edgeTTSModule.EdgeTTS ||
-  edgeTTSModule.MsEdgeTTS ||
-  edgeTTSModule.default;
-
-// OpenAI 风格错误返回
-function openaiErrorResponse(message, type = "invalid_request_error", status = 400, extraHeaders = {}) {
+// OpenAI 格式错误响应
+function openaiError(message, type = "invalid_request_error", status = 400, extraHeaders = {}) {
   return new Response(JSON.stringify({
-    error: {
-      message,
-      type
-    }
+    error: { message, type }
   }), {
     status,
     headers: {
@@ -89,43 +80,47 @@ function openaiErrorResponse(message, type = "invalid_request_error", status = 4
 function getCorsHeaders() {
   return {
     "Access-Control-Allow-Origin": ALLOW_ORIGIN,
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Methods": "POST,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type,Authorization"
   };
 }
 
 export default function onRequest(context) {
   const { request } = context;
-  const corsHeaders = getCorsHeaders();
+  const cors = getCorsHeaders();
 
   if (request.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response(null, { headers: cors });
   }
   if (request.method !== "POST") {
-    return openaiErrorResponse("Method not allowed", "invalid_request_error", 405, corsHeaders);
+    return openaiError("Method not allowed", "invalid_request_error", 405, cors);
   }
 
   const auth = request.headers.get("Authorization");
   if (!auth || !auth.startsWith("Bearer ")) {
-    return openaiErrorResponse("Authentication failed", "authentication_error", 401, corsHeaders);
+    return openaiError("Authentication failed", "authentication_error", 401, cors);
   }
-  const bearerToken = auth.replace("Bearer ", "").trim();
-  if (bearerToken !== SECRET_KEY) {
-    return openaiErrorResponse("Incorrect API key provided", "authentication_error", 401, corsHeaders);
+  const token = auth.replace("Bearer ", "").trim();
+  if (token !== SECRET_KEY) {
+    return openaiError("Incorrect API key provided", "authentication_error", 401, cors);
   }
 
-  return handleSpeech(request, corsHeaders);
+  return handleSpeech(request, cors);
 }
 
 async function handleSpeech(request, corsHeaders) {
   try {
     const voices = await getVoiceList();
-    const body = await request.json().catch(() => null);
-    if (!body) {
-      return openaiErrorResponse("Invalid JSON body", "invalid_request_error", 400, corsHeaders);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return openaiError("Invalid JSON body", "invalid_request_error", 400, corsHeaders);
     }
 
-    // OpenAI 标准字段
+    // 打印日志，排查收到的输入文本
+    console.log("收到请求 body.input =", JSON.stringify(body.input));
+
     const {
       model = "tts-1",
       input,
@@ -135,57 +130,49 @@ async function handleSpeech(request, corsHeaders) {
     } = body;
 
     if (!input || typeof input !== "string" || input.trim() === "") {
-      return openaiErrorResponse("Input text is required", "invalid_request_error", 400, corsHeaders);
+      return openaiError("Input text is required", "invalid_request_error", 400, corsHeaders);
     }
 
-    // 1. 解析 voice：优先映射 OpenAI 标准 voice 名称
+    // 解析目标音色
     let resolvedVoice;
     if (voice && OPENAI_VOICE_MAP[voice]) {
       resolvedVoice = OPENAI_VOICE_MAP[voice];
     } else if (voice) {
       resolvedVoice = voice;
     }
-
-    // 2. 如果 model 本身是微软音色 id，且没有指定 voice，则使用 model 作为音色（旧兼容）
+    // 兼容：model 本身是音色 ID 时直接使用
     if (!resolvedVoice && voices.includes(model)) {
       resolvedVoice = model;
     }
-
-    // 3. 如果 model 是 tts-1 / tts-1-hd，并且 voice 也没给，使用默认音色
+    // 标准 tts-1 / tts-1-hd 且没指定 voice，使用默认音色
     if (!resolvedVoice && OPENAI_TTS_MODELS.includes(model)) {
       resolvedVoice = DEFAULT_VOICE;
     }
 
     if (!resolvedVoice || !voices.includes(resolvedVoice)) {
-      return openaiErrorResponse(`Voice ${resolvedVoice ?? voice} is not supported`, "invalid_request_error", 400, corsHeaders);
+      return openaiError(`Voice ${resolvedVoice ?? voice} is not supported`, "invalid_request_error", 400, corsHeaders);
     }
 
-    // 校验输出格式，当前只稳定支持 mp3
     if (response_format !== "mp3") {
-      return openaiErrorResponse(`response_format '${response_format}' is not supported, only mp3`, "invalid_request_error", 400, corsHeaders);
+      return openaiError(`Only mp3 response_format supported`, "invalid_request_error", 400, corsHeaders);
     }
 
-    // speed 校验：OpenAI 范围 0.25 ~ 4.0
     const speedNum = Number(speed);
     if (!Number.isFinite(speedNum) || speedNum < 0.25 || speedNum > 4.0) {
-      return openaiErrorResponse("speed must be between 0.25 and 4.0", "invalid_request_error", 400, corsHeaders);
+      return openaiError("speed must be between 0.25 and 4.0", "invalid_request_error", 400, corsHeaders);
     }
-
-    const rateValue = `${((speedNum - 1) * 100).toFixed(0)}%`;
+    const ratePercent = `${((speedNum - 1) * 100).toFixed(0)}%`;
     const lang = getLangFromVoiceId(resolvedVoice);
 
-    if (typeof EdgeTTSClass !== "function") {
-      return openaiErrorResponse("TTS module load error", "server_error", 500, corsHeaders);
-    }
-
-    const tts = new EdgeTTSClass({
+    const tts = new EdgeTTS({
       voice: resolvedVoice,
       lang,
-      rate: rateValue,
+      rate: ratePercent,
       timeout: 30000
     });
 
     const audioChunks = [];
+    // 重点：只收集 Buffer（音频），跳过字幕、文本元数据对象
     for await (const chunk of tts.streamAudio(input)) {
       if (Buffer.isBuffer(chunk)) {
         audioChunks.push(chunk);
@@ -193,20 +180,21 @@ async function handleSpeech(request, corsHeaders) {
     }
 
     if (audioChunks.length === 0) {
-      return openaiErrorResponse("No audio data generated", "server_error", 502, corsHeaders);
+      return openaiError("No audio generated", "server_error", 502, corsHeaders);
     }
+    const audioBuf = Buffer.concat(audioChunks);
 
-    const audioBuffer = Buffer.concat(audioChunks);
-    return new Response(audioBuffer, {
+    return new Response(audioBuf, {
       headers: {
         "Content-Type": "audio/mpeg",
-        "Content-Length": audioBuffer.length,
+        "Content-Length": audioBuf.length,
+        "Cache-Control": "no-store",
         ...corsHeaders
       }
     });
 
-  } catch (error) {
-    console.error("TTS 合成失败:", error?.message || error);
-    return openaiErrorResponse("The server encountered an error", "server_error", 502, corsHeaders);
+  } catch (err) {
+    console.error("TTS 合成异常：", err);
+    return openaiError("Server error", "server_error", 500, corsHeaders);
   }
 }
